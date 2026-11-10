@@ -1,0 +1,603 @@
+"""Job executor: runs the step tree of a released job against live detection states.
+
+Runs in the Qt main thread. Inputs: detection states (camera thread -> queued signal), barcode
+scans, operator answers and a 10 Hz timer. Outputs: Qt signals for the UI / projector and
+result records for the background recorder.
+"""
+from __future__ import annotations
+
+import logging
+import re
+import time
+import uuid
+from datetime import datetime, timezone
+
+from PySide6.QtCore import QObject, QTimer, Signal
+
+from vista.engine.steps import CONTAINERS, STEP_SPECS
+
+log = logging.getLogger(__name__)
+
+PENDING, ACTIVE, DONE, SKIPPED, FAILED = "PENDING", "ACTIVE", "DONE", "SKIPPED", "FAILED"
+_VAR_RE = re.compile(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}")
+
+
+def _utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class Node:
+    __slots__ = ("step", "children", "parent", "state", "result", "t_start", "dt_start", "idx", "repeat_i",
+                 "base_counter", "count_needed", "ng_recorded", "data", "number")
+
+    def __init__(self, step: dict, parent: "Node | None"):
+        self.step, self.parent = step, parent
+        self.children: list[Node] = []
+        self.number = ""
+        self.reset()
+
+    def reset(self) -> None:
+        self.state, self.result = PENDING, None
+        self.t_start, self.dt_start = 0.0, None
+        self.idx, self.repeat_i, self.base_counter, self.count_needed = 0, 0, 0, 1
+        self.ng_recorded = False
+        self.data = {}
+        for c in self.children:
+            c.reset()
+
+    @property
+    def type(self) -> str:
+        return self.step["step_type"]
+
+    @property
+    def params(self) -> dict:
+        return self.step.get("params") or {}
+
+    @property
+    def is_container(self) -> bool:
+        return self.type in CONTAINERS
+
+    def path(self) -> str:
+        parts, n = [], self
+        while n is not None and n.step.get("id") is not None:
+            parts.append(n.step["name"])
+            n = n.parent
+        return " / ".join(reversed(parts))
+
+    def walk(self):
+        yield self
+        for c in self.children:
+            yield from c.walk()
+
+
+class Executor(QObject):
+    run_started = Signal(dict)
+    run_finished = Signal(dict)
+    tree_changed = Signal()
+    message = Signal(str, str)             # text, level: info|warn|error|ok
+    dialog_requested = Signal(dict)        # {"node": id, "question": str, "options": [...]}
+    supervisor_requested = Signal(dict)    # {"node": id, "reason": str}
+    identity_changed = Signal(dict)        # barcode / variant
+
+    def __init__(self, ctx):
+        super().__init__()
+        self.ctx = ctx
+        self.job: dict | None = None
+        self.variants: list[dict] = []
+        self.root: Node | None = None
+        self.mode = "IDLE"                 # IDLE | READY | RUNNING | RESULT
+        self.run_id: uuid.UUID | None = None
+        self.variant: dict | None = None
+        self.barcode: str | None = None
+        self.variables: dict[str, str] = {}
+        self.states: dict = {}
+        self.ng_count = self.forced_count = 0
+        self.run_t0 = 0.0
+        self.run_dt0: datetime | None = None
+        self.last_result: dict | None = None
+        self._pending_scan: str | None = None
+        self._result_until = 0.0
+        self._reset_counter: dict[int, int] = {}
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(100)
+
+    # ================================================================== job loading
+    def load_job(self, job: dict, variants: list[dict], steps: list[dict]) -> None:
+        if self.mode == "RUNNING":
+            self.abort("Job changed")
+        by_parent: dict = {}
+        for s in steps:
+            by_parent.setdefault(s["parent_id"], []).append(s)
+        root = Node({"id": None, "name": job["name"], "step_type": "NUMBERED", "params": {}}, None)
+
+        def build(node: Node, parent_id):
+            for s in sorted(by_parent.get(parent_id, []), key=lambda r: (r["sort_order"], r["id"])):
+                child = Node(s, node)
+                node.children.append(child)
+                if s["step_type"] in CONTAINERS:
+                    build(child, s["id"])
+        build(root, None)
+
+        def number(node: Node, prefix: str):
+            i = 0
+            for c in node.children:
+                if c.type == "NUMBERED":
+                    i += 1
+                    c.number = f"{prefix}{i}."
+                    number(c, c.number)
+                elif c.is_container:
+                    number(c, prefix)
+        number(root, "")
+        self.job, self.variants, self.root = job, [v for v in variants if v.get("is_active", True)], root
+        self.mode = "READY"
+        self.tree_changed.emit()
+
+    def unload(self) -> None:
+        if self.mode == "RUNNING":
+            self.abort("Job unloaded")
+        self.job, self.root, self.mode = None, None, "IDLE"
+        self.ctx.engine.set_watch(self._always_watch())
+        self.tree_changed.emit()
+
+    # ================================================================== run control
+    def start_run(self, variant_code: str | None = None) -> None:
+        if self.root is None or self.job is None:
+            self.message.emit("Select a released job first.", "warn")
+            return
+        if self.job.get("status") != "RELEASED":
+            self.message.emit("This job is not released for production.", "error")
+            return
+        self.root.reset()
+        self.run_id = uuid.uuid4()
+        self.variables = {"JOB": self.job["code"]}
+        self.variant = next((v for v in self.variants if v["code"] == variant_code), None)
+        if self.variant is None and len(self.variants) == 1:
+            self.variant = self.variants[0]
+        self.barcode = None
+        self.ng_count = self.forced_count = 0
+        self.run_t0, self.run_dt0 = time.monotonic(), _utc()
+        self.mode = "RUNNING"
+        self._overtime = False
+        self.ctx.recorder.start_run(self.run_id, self.job["id"], self.job["revision"], self.ctx.session.user_id,
+                                    self.run_dt0)
+        if self.variant:
+            self.variables["VARIANT"] = self.variant["code"]
+            self.ctx.recorder.identity(self.run_id, None, self.variant["code"])
+        self._activate(self.root)
+        self.run_started.emit({"run_id": str(self.run_id), "job": self.job["code"]})
+        self.identity_changed.emit(self.identity())
+        self._advance()
+
+    def abort(self, reason: str = "Aborted by operator") -> None:
+        if self.mode != "RUNNING":
+            return
+        self._finish("ABORTED", reason)
+
+    def identity(self) -> dict:
+        return {"barcode": self.barcode, "variant": self.variant["code"] if self.variant else None,
+                "variant_name": self.variant["name"] if self.variant else None}
+
+    # ================================================================== inputs
+    def on_states(self, states: dict) -> None:
+        self.states = states
+        self._check_reset_button()
+        if self.mode == "RUNNING":
+            self._advance()
+
+    def on_barcode(self, code: str) -> None:
+        code = code.strip()
+        if not code:
+            return
+        if self.mode == "RUNNING":
+            self._pending_scan = code
+            self._advance()
+        elif self.mode == "READY" and self.ctx.settings.get("start_on_scan", True):
+            self.start_run()
+            self._pending_scan = code
+            self._advance()
+
+    def answer_dialog(self, node_id: int, option: str) -> None:
+        node = self._find(node_id)
+        if node is not None and node.state == ACTIVE and node.type == "OPERATOR_DIALOG":
+            node.data["answer"] = option
+            self._advance()
+
+    def confirm_instruction(self) -> None:
+        for n in self.active_leaves():
+            if n.type == "WORK_INSTRUCTION":
+                n.data["confirmed"] = True
+        self._advance()
+
+    def supervisor_decision(self, node_id: int, accept: bool, user_id: int, username: str) -> None:
+        node = self._find(node_id)
+        if node is None or node.state != ACTIVE:
+            return
+        self.ctx.audit("SUPERVISOR_DECISION", "step", node.step.get("id"),
+                       {"accept": accept, "step": node.path(), "run": str(self.run_id), "by": username})
+        if accept:
+            self._complete(node, "FORCED", value="Accepted by supervisor", actor=user_id)
+            self.forced_count += 1
+            self._advance()
+        else:
+            self._complete(node, "NG", value="Rejected by supervisor", actor=user_id)
+            self._finish("FAIL", f"Rejected by supervisor at {node.step['name']}")
+
+    def force_active(self, user_id: int, username: str) -> None:
+        """Supervisor override: complete all currently active leaf steps as FORCED."""
+        leaves = self.active_leaves()
+        for n in leaves:
+            self._complete(n, "FORCED", value=f"Forced by {username}", actor=user_id)
+            self.forced_count += 1
+        if leaves:
+            self.ctx.audit("FORCE_STEP", "run", str(self.run_id), {"steps": [n.path() for n in leaves],
+                                                                   "by": username})
+            self._advance()
+
+    # ================================================================== queries
+    def active_leaves(self) -> list[Node]:
+        if self.root is None or self.mode != "RUNNING":
+            return []
+        return [n for n in self.root.walk() if n.state == ACTIVE and not n.is_container]
+
+    def active_numbered(self) -> Node | None:
+        for n in self.active_leaves():
+            p = n.parent
+            while p is not None and p.type != "NUMBERED":
+                p = p.parent
+            if p is not None and p.step.get("id") is not None:
+                return p
+        return None
+
+    def _find(self, step_id) -> Node | None:
+        if self.root is None:
+            return None
+        return next((n for n in self.root.walk() if n.step.get("id") == step_id), None)
+
+    def _always_watch(self) -> set[int]:
+        if not self.ctx.settings.get("reset_enabled", True):
+            return set()
+        return {d for d, m in self.ctx.engine.meta().items()
+                if m["det_type"] == "BUTTON" and (m.get("params") or {}).get("function") == "RESET"}
+
+    # ================================================================== core
+    def _included(self, node: Node) -> bool:
+        s = node.step
+        if s.get("id") is None:
+            return True
+        if not s.get("enabled", True):
+            return False
+        codes = s.get("variant_codes") or []
+        if codes and self.variant is not None and self.variant["code"] not in codes:
+            return False
+        return True
+
+    def _activate(self, node: Node) -> None:
+        if not self._included(node):
+            node.state = SKIPPED
+            return
+        node.state = ACTIVE
+        node.t_start, node.dt_start = time.monotonic(), _utc()
+        if node.is_container:
+            node.idx = 0
+            if node.params.get("order") == "ANY_ORDER":
+                for c in node.children:
+                    self._activate(c)
+            elif node.children:
+                self._activate(node.children[0])
+            return
+        det_id = node.step.get("detection_id")
+        st = self.states.get(det_id) if det_id else None
+        node.base_counter = st.counter if st else 0
+        node.count_needed = int(node.params.get("count", 1) or 1)
+
+    def _advance(self) -> None:
+        if self.mode != "RUNNING" or self.root is None:
+            return
+        for _ in range(50):                 # instant steps may complete in a chain
+            before = self._signature()
+            if self._update(self.root):
+                self._finish("PASS")
+                return
+            if self.mode != "RUNNING":
+                return
+            if self._signature() == before:
+                break
+        self.ctx.engine.set_watch(self._watch_ids())
+        self.tree_changed.emit()
+
+    def _signature(self):
+        return tuple(n.state for n in self.root.walk())
+
+    def _watch_ids(self) -> set[int]:
+        ids = {n.step["detection_id"] for n in self.active_leaves() if n.step.get("detection_id")}
+        return ids | self._always_watch()
+
+    def _update(self, node: Node) -> bool:
+        if node.state in (DONE, SKIPPED):
+            return True
+        if node.state == FAILED:
+            return False
+        if node.state == PENDING:
+            self._activate(node)
+            if node.state == SKIPPED:
+                return True
+        if node.is_container:
+            return self._update_container(node)
+        return self._update_leaf(node)
+
+    def _update_container(self, node: Node) -> bool:
+        any_order = node.params.get("order") == "ANY_ORDER"
+        while True:
+            if any_order:
+                results = [self._update(c) for c in list(node.children)]   # evaluate every child
+                done = all(results) and all(c.state in (DONE, SKIPPED) for c in node.children)
+            else:
+                done = True
+                while node.idx < len(node.children):
+                    c = node.children[node.idx]
+                    if not self._update(c):
+                        done = False
+                        break
+                    node.idx += 1
+            if not done:
+                return False
+            repeat = int(node.params.get("repeat", 1) or 1)
+            if node.repeat_i + 1 < repeat:
+                node.repeat_i += 1
+                for c in node.children:
+                    c.reset()
+                node.idx = 0
+                if any_order:
+                    for c in node.children:
+                        self._activate(c)
+                elif node.children:
+                    self._activate(node.children[0])
+                continue
+            node.state = DONE
+            return True
+
+    def _det_state(self, node: Node):
+        det_id = node.step.get("detection_id")
+        return self.states.get(det_id) if det_id else None
+
+    def _update_leaf(self, node: Node) -> bool:
+        t = node.type
+        p = node.params
+        elapsed = time.monotonic() - node.t_start
+        timeout = float(p.get("timeout_s", 0) or 0)
+        if timeout and elapsed > timeout and not node.data.get("warned"):
+            node.data["warned"] = True
+            self.message.emit(f"Step '{node.step['name']}' is taking longer than {int(timeout)} s", "warn")
+
+        if STEP_SPECS[t]["detection"] and not node.step.get("detection_id"):
+            if not node.data.get("blocked"):
+                node.data["blocked"] = True
+                self.message.emit(f"Step '{node.step['name']}' has no detection - a supervisor must force it.",
+                                  "error")
+            return False
+
+        if t in ("PLACE", "TAKE"):
+            st = self._det_state(node)
+            if st is None or st.state in ("UNTAUGHT", "DISABLED"):
+                return self._blocked(node, "detection is not taught or disabled")
+            want = "PRESENT" if t == "PLACE" else "ABSENT"
+            if st.state == want:
+                self._complete(node, "OK", score=st.score)
+                return True
+            return False
+
+        if t in ("ACTIVITY", "PRESS"):
+            st = self._det_state(node)
+            if st is None or st.state in ("UNTAUGHT", "DISABLED"):
+                return self._blocked(node, "detection is not taught or disabled")
+            if st.counter - node.base_counter >= node.count_needed:
+                self._complete(node, "OK")
+                return True
+            return False
+
+        if t == "QUALITY_CHECK":
+            return self._update_qc(node)
+
+        if t == "WAIT_BARCODE":
+            code = self._pending_scan
+            if code is None:
+                return False
+            self._pending_scan = None
+            return self._accept_barcode(node, code)
+
+        if t == "SNAPSHOT":
+            path = self.ctx.save_evidence(self.run_id, self.barcode, node.step["name"], p.get("source", "COLOR"))
+            self._complete(node, "INFO", evidence=path)
+            return True
+
+        if t == "SET_VARIABLE":
+            value = _VAR_RE.sub(lambda m: self.variables.get(m.group(1), ""), str(p.get("value", "")))
+            if p.get("variable"):
+                self.variables[p["variable"]] = value
+            if p.get("record", True):
+                self._complete(node, "INFO", value=value)
+            else:
+                node.state = DONE
+            return True
+
+        if t == "DELAY":
+            if elapsed * 1000 >= float(p.get("ms", 1000)):
+                node.state = DONE
+                return True
+            return False
+
+        if t == "OPERATOR_DIALOG":
+            if "asked" not in node.data:
+                node.data["asked"] = True
+                opts = [o.strip() for o in str(p.get("options", "OK,NOT OK")).split(",") if o.strip()]
+                self.dialog_requested.emit({"node": node.step["id"], "question": p.get("question", ""),
+                                            "options": opts})
+            ans = node.data.get("answer")
+            if ans is None:
+                return False
+            if p.get("variable"):
+                self.variables[p["variable"]] = ans
+            ng = {o.strip() for o in str(p.get("ng_options", "")).split(",") if o.strip()}
+            if ans in ng:
+                self._complete(node, "NG", value=ans)
+                self.ng_count += 1
+                self._finish("FAIL", f"{node.step['name']}: {ans}")
+                return False
+            self._complete(node, "OK", value=ans)
+            return True
+
+        if t == "WORK_INSTRUCTION":
+            if node.data.get("confirmed"):
+                self._complete(node, "OK")
+                return True
+            return False
+        return False
+
+    def _blocked(self, node: Node, why: str) -> bool:
+        if not node.data.get("blocked"):
+            node.data["blocked"] = True
+            self.message.emit(f"Step '{node.step['name']}' is blocked: {why}.", "error")
+        return False
+
+    def _update_qc(self, node: Node) -> bool:
+        st = self._det_state(node)
+        if st is None or st.state in ("UNTAUGHT", "DISABLED"):
+            return self._blocked(node, "quality check is not taught or disabled")
+        if st.state == "OK":
+            ev = None
+            if node.params.get("save_evidence", True) and self.ctx.settings.get("save_pass_evidence", True):
+                ev = self.ctx.save_evidence(self.run_id, self.barcode, node.step["name"], self._qc_source(node),
+                                            roi_det=node.step.get("detection_id"))
+            self._complete(node, "OK", score=st.score, qc_class=st.qc_class, evidence=ev)
+            return True
+        if st.state in ("NG", "MISSING"):
+            policy = node.params.get("on_fail", "REWORK")
+            if not node.ng_recorded:
+                node.ng_recorded = True
+                self.ng_count += 1
+                ev = self.ctx.save_evidence(self.run_id, self.barcode, node.step["name"] + "_NG",
+                                            self._qc_source(node), roi_det=node.step.get("detection_id"))
+                self.ctx.recorder.step_result(self.run_id, self._result_row(node, "NG", score=st.score,
+                                                                            qc_class=st.qc_class, evidence=ev,
+                                                                            final=False))
+                self.message.emit(f"{node.step['name']}: {st.qc_class} - "
+                                  + ("rework and the check repeats automatically" if policy == "REWORK"
+                                     else "supervisor decision required" if policy == "ASK_SUPERVISOR"
+                                     else "part rejected"), "error")
+                if policy == "FAIL_RUN":
+                    node.state = FAILED
+                    self._finish("FAIL", f"{node.step['name']}: {st.qc_class}")
+                    return False
+                if policy == "ASK_SUPERVISOR":
+                    self.supervisor_requested.emit({"node": node.step["id"],
+                                                    "reason": f"{node.step['name']}: {st.qc_class}"})
+        return False
+
+    def _qc_source(self, node: Node) -> str:
+        meta = self.ctx.engine.meta().get(node.step.get("detection_id"), {})
+        return meta.get("sensor", "COLOR")
+
+    def _accept_barcode(self, node: Node, code: str) -> bool:
+        p = node.params
+        if p.get("regex"):
+            try:
+                if not re.fullmatch(p["regex"], code):
+                    self.message.emit(f"Barcode '{code}' does not match the expected format.", "error")
+                    return False
+            except re.error:
+                self.message.emit("Barcode format (regex) in this step is invalid - fix the job.", "error")
+                return False
+        if p.get("select_variant", True) and self.variants:
+            matches = []
+            for v in self.variants:
+                rx = v.get("barcode_regex")
+                if rx:
+                    try:
+                        if re.fullmatch(rx, code):
+                            matches.append(v)
+                    except re.error:
+                        log.warning("Invalid regex on variant %s", v["code"])
+            if len(matches) == 1:
+                self.variant = matches[0]
+            elif len(matches) > 1:
+                self.message.emit("Barcode matches more than one variant - check variant patterns.", "error")
+                return False
+            elif self.variant is None and any(v.get("barcode_regex") for v in self.variants):
+                self.message.emit(f"Barcode '{code}' does not belong to any variant of this job.", "error")
+                return False
+        policy = p.get("duplicate_policy", "STATION_DEFAULT")
+        if policy == "STATION_DEFAULT":
+            policy = self.ctx.settings.get("duplicate_policy", "BLOCK")
+        if policy != "ALLOW":
+            prev = self.ctx.last_pass_for_barcode(code)
+            if prev:
+                when = prev["started_at"].astimezone().strftime("%d-%m-%Y %H:%M")
+                if policy == "BLOCK":
+                    self.message.emit(f"Barcode {code} already PASSED on {when}. Re-inspection is blocked.", "error")
+                    self.ctx.audit("DUPLICATE_BLOCKED", "barcode", code, {"previous_run": str(prev["id"])})
+                    return False
+                self.message.emit(f"Barcode {code} already passed on {when}.", "warn")
+        self.barcode = code
+        self.variables[p.get("variable") or "BARCODE"] = code
+        if self.variant:
+            self.variables["VARIANT"] = self.variant["code"]
+        self.ctx.recorder.identity(self.run_id, code, self.variant["code"] if self.variant else None)
+        self._complete(node, "OK", value=code)
+        self.identity_changed.emit(self.identity())
+        return True
+
+    # ================================================================== results
+    def _result_row(self, node: Node, result: str, *, score=None, qc_class=None, value=None, evidence=None,
+                    actor=None, final=True) -> dict:
+        now = _utc()
+        det = self.ctx.engine.meta().get(node.step.get("detection_id"), {})
+        return {"step_id": node.step.get("id"), "step_name": node.step["name"], "step_path": node.path(),
+                "step_type": node.type, "detection_name": det.get("name"), "started_at": node.dt_start,
+                "finished_at": now, "duration_ms": int((time.monotonic() - node.t_start) * 1000),
+                "result": result, "qc_class": qc_class, "score": None if score is None else float(score),
+                "value": value, "evidence_path": evidence, "actor_id": actor}
+
+    def _complete(self, node: Node, result: str, **kw) -> None:
+        node.state, node.result = DONE, result
+        node.data["t_done"] = time.monotonic()
+        self.ctx.recorder.step_result(self.run_id, self._result_row(node, result, **kw))
+
+    def _finish(self, result: str, remarks: str | None = None) -> None:
+        cycle_ms = int((time.monotonic() - self.run_t0) * 1000)
+        self.ctx.recorder.finish_run(self.run_id, result, _utc(), cycle_ms, self.ng_count, self.forced_count, remarks)
+        self.last_result = {"run_id": str(self.run_id), "result": result, "barcode": self.barcode,
+                            "variant": self.variant["code"] if self.variant else None, "cycle_ms": cycle_ms,
+                            "ng": self.ng_count, "forced": self.forced_count, "remarks": remarks}
+        self.mode = "RESULT"
+        self._result_until = time.monotonic() + self.ctx.settings.get("result_display_ms", 3000) / 1000.0
+        self.ctx.engine.set_watch(self._always_watch())
+        self.message.emit(f"{result}: {remarks}" if remarks else result,
+                          "ok" if result == "PASS" else "error" if result == "FAIL" else "warn")
+        self.tree_changed.emit()
+        self.run_finished.emit(self.last_result)
+
+    def _tick(self) -> None:
+        if self.mode == "RUNNING":
+            limit = float((self.job or {}).get("expected_cycle_s") or 0)
+            if (limit and self.ctx.settings.get("overtime_warning", True) and not getattr(self, "_overtime", False)
+                    and time.monotonic() - self.run_t0 > limit):
+                self._overtime = True
+                self.message.emit(f"Cycle time above the expected {int(limit)} s", "warn")
+            self._advance()
+        elif self.mode == "RESULT" and time.monotonic() >= self._result_until:
+            self.mode = "READY"
+            self.tree_changed.emit()
+            if self.ctx.settings.get("auto_restart", True) and self.job is not None:
+                self.start_run(self.variant["code"] if self.variant and len(self.variants) == 1 else None)
+
+    def _check_reset_button(self) -> None:
+        for det_id in self._always_watch():
+            st = self.states.get(det_id)
+            if st is None:
+                continue
+            prev = self._reset_counter.get(det_id)
+            self._reset_counter[det_id] = st.counter
+            if prev is not None and st.counter > prev and self.mode == "RUNNING":
+                self.ctx.audit("RESET_BUTTON", "run", str(self.run_id), {})
+                self.abort("Reset button pressed")

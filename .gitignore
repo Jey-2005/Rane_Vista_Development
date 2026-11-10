@@ -1,0 +1,10 @@
+.env
+*.env
+!.env.example
+data/
+build/dist/
+build/work/
+dist/
+__pycache__/
+*.pyc
+.venv/

@@ -1,0 +1,2 @@
+# Intel RealSense SDK Python wrapper (D456 / D457). Wheels exist for Windows x64, Python 3.8 - 3.13.
+pyrealsense2>=2.55
